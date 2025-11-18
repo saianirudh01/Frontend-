@@ -91,7 +91,23 @@ export default function SubmissionListScreen({ navigation }) {
     return (
       <TouchableOpacity 
         style={styles.card}
-        onPress={() => navigation.navigate('ViewNews', { articleId: item._id })}
+        onPress={() => {
+          console.log('🔗 Navigating to ViewNews with item:', item);
+          navigation.navigate('ViewNews', { 
+            article: {
+              id: item._id,
+              title: item.title,
+              description: item.description,
+              category: item.category,
+              date: item.submittedAt || item.date || new Date().toISOString(),
+              status: item.status,
+              mediaUrl: item.mediaUrl,
+              mediaType: item.mediaType,
+              location: item.location || null,
+              reporterName: item.reporterName || 'Unknown Reporter',
+            }
+          });
+        }}
       >
         <Image
           source={{ uri: item.mediaUrl }}
@@ -105,7 +121,7 @@ export default function SubmissionListScreen({ navigation }) {
             News ID: #{item._id?.slice(0, 8) || 'N/A'}
           </Text>
           <Text style={styles.cardMeta}>
-            {item.category} • {item.date} • {item.status}
+            {item.category} • {new Date(item.submittedAt || item.date).toLocaleDateString()} • {item.status}
           </Text>
         </View>
         <Ionicons name={status.icon} size={24} color={status.color} />

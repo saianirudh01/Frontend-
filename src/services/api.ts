@@ -5,7 +5,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // Create an Axios instance to talk to your backend
 const api = axios.create({
-  baseURL: BASE_URL, // This is the main admin auth API (configured in `config.ts`)
+  baseURL: `${BASE_URL}/api`, // Add /api prefix to base URL
   headers: {
     'Content-Type': 'application/json',
   },
@@ -13,7 +13,15 @@ const api = axios.create({
 
 // Create separate axios instance for news operations
 const newsApi = axios.create({
-  baseURL: NEWS_API_BASE_URL,
+  baseURL: `${NEWS_API_BASE_URL}/api`, // Add /api prefix to base URL
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+// Create axios instance for media operations (without /api prefix)
+const mediaApi = axios.create({
+  baseURL: NEWS_API_BASE_URL, // No /api prefix - direct base URL
   headers: {
     'Content-Type': 'application/json',
   },
@@ -125,9 +133,16 @@ export const login = async (userId, password) => {
 export const fetchMySubmissions = async (jornalistId: string) => {
   try {
     const response = await newsApi.get(`/news/by-journalist/${jornalistId}`);
+    console.log('📡 Submissions API response type:', typeof response.data);
     console.log('📡 Submissions API response:', response.data);
     
     const newsList = response.data;
+    
+    // Check if response is HTML (error case)
+    if (typeof newsList === 'string' && newsList.includes('<!doctype html>')) {
+      console.error('❌ API returned HTML instead of JSON - backend may not be running properly');
+      throw new Error('Backend API is not responding correctly. Please check if the server is running.');
+    }
     
     // Handle if response is not an array
     if (!Array.isArray(newsList)) {
@@ -135,23 +150,49 @@ export const fetchMySubmissions = async (jornalistId: string) => {
       return [];
     }
     
+    // Fetch media data to associate with news items
+    let mediaMap = {};
+    try {
+      const mediaResponse = await newsApi.get('/media/');
+      console.log('📡 Fetched media data:', mediaResponse.data.length, 'items');
+      
+      // Create a map of news_id to media info
+      if (Array.isArray(mediaResponse.data)) {
+        mediaResponse.data.forEach((media: any) => {
+          if (media.news_id) {
+            mediaMap[media.news_id] = {
+              url: `${NEWS_API_BASE_URL}${media.file_path}`,
+              type: media.media_type,
+              thumbnail: media.thumbnail_path ? `${NEWS_API_BASE_URL}${media.thumbnail_path}` : null,
+            };
+          }
+        });
+      }
+      console.log('📡 Created media map with', Object.keys(mediaMap).length, 'entries');
+    } catch (mediaError) {
+      console.warn('⚠️ Could not fetch media data:', mediaError);
+    }
+    
     // Transform admin API response to match app's Submission interface
-    return newsList.map((item: any) => ({
-      _id: item.news_id,
-      title: item.news_title,
-      description: item.news_description,
-      category: item.category_name,
-      status: item.status_code === 'DRAFT' ? 'Draft' : 
-              item.status_code === 'PENDING' ? 'Submitted' :
-              item.status_code === 'APPROVED' ? 'Review' :
-              item.status_code === 'PUBLISHED' ? 'Published' :
-              item.status_code === 'REJECTED' ? 'Revision Requested' : item.status_code,
-      submittedAt: item.creation_date || new Date().toISOString(),
-      mediaUrl: item.media_url || item.mediaUrl || null, // Support both field names
-      mediaType: item.media_type || item.mediaType || null,
-      location: item.location,
-      reporterName: item.reporter_name
-    }));
+    return newsList.map((item: any) => {
+      const mediaInfo = mediaMap[item.news_id];
+      return {
+        _id: item.news_id,
+        title: item.news_title,
+        description: item.news_description,
+        category: item.category_name,
+        status: item.status_code === 'DRAFT' ? 'Draft' : 
+                item.status_code === 'PENDING' ? 'Submitted' :
+                item.status_code === 'APPROVED' ? 'Review' :
+                item.status_code === 'PUBLISHED' ? 'Published' :
+                item.status_code === 'REJECTED' ? 'Revision Requested' : item.status_code,
+        submittedAt: item.creation_date || new Date().toISOString(),
+        mediaUrl: mediaInfo?.url || item.media_url || item.mediaUrl || null,
+        mediaType: mediaInfo?.type || item.media_type || item.mediaType || null,
+        location: item.location,
+        reporterName: item.reporter_name
+      };
+    });
   } catch (error) {
     console.error('❌ Error fetching submissions:', error);
     console.error('❌ Error response:', error.response?.data);
@@ -199,8 +240,20 @@ export const getAllNews = async () => {
   try {
     console.log('🔄 Fetching news from:', `${NEWS_API_BASE_URL}/news/`);
     const response = await newsApi.get('/news/');
+    
+    // Check if response is HTML (error case)
+    if (typeof response.data === 'string' && response.data.includes('<!doctype html>')) {
+      console.error('❌ API returned HTML instead of JSON - backend may not be running properly');
+      throw new Error('Backend API is not responding correctly. Please check if the server is running at ' + NEWS_API_BASE_URL);
+    }
+    
     // Admin API returns array of news items
     const newsList = response.data || [];
+    
+    if (!Array.isArray(newsList)) {
+      console.error('❌ API response is not an array:', typeof newsList);
+      throw new Error('Invalid API response format');
+    }
     
     console.log('✅ Received', newsList.length, 'news items');
     
@@ -212,14 +265,16 @@ export const getAllNews = async () => {
       
       // Create a map of news_id to media_url
       const mediaMap = new Map();
-      mediaList.forEach((media: any) => {
-        if (media.news_id && media.file_path) {
-          mediaMap.set(media.news_id, {
-            url: media.file_path,
-            type: media.media_type || 'image'
-          });
-        }
-      });
+      if (Array.isArray(mediaList)) {
+        mediaList.forEach((media: any) => {
+          if (media.news_id && media.file_path) {
+            mediaMap.set(media.news_id, {
+              url: media.file_path,
+              type: media.media_type || 'image'
+            });
+          }
+        });
+      }
       
       // Transform and add media URLs
       return newsList.map((item: any) => {
@@ -308,10 +363,10 @@ export const submitNews = async (newsData) => {
 };
 
 // --- Media Upload (for Image/Video) ---
-// Calls POST /media/upload on admin news API (NEWS_API_BASE_URL)
+// Calls POST /api/media/upload on News API server (uses mediaApi which has no /api prefix)
 export const uploadMedia = async (fileUri: string, mediaType: 'image'|'video') => {
   try {
-    console.log('🔄 Uploading media to:', `${NEWS_API_BASE_URL}/media/upload`);
+    console.log('🔄 Uploading media to News API server:', `${NEWS_API_BASE_URL}/api/media/upload`);
     console.log('📎 File URI:', fileUri);
     console.log('📎 Media type:', mediaType);
     
@@ -327,17 +382,24 @@ export const uploadMedia = async (fileUri: string, mediaType: 'image'|'video') =
       console.log('📦 Blob type:', blob.type);
       console.log('📦 Filename:', filename);
       
-      // Create File object from blob (FastAPI expects this format)
+      // Create File object from blob
       const file = new File([blob], filename, { type: blob.type });
       formData.append('file', file);
       
-      // Use fetch API instead of axios for web uploads (better FormData support)
-      console.log('🔄 Uploading to AI server:', `${AI_BASE_URL}/upload`);
-      const uploadResponse = await fetch(`${AI_BASE_URL}/upload`, {
-        method: 'POST',
-        body: formData,
-        // Don't set Content-Type - browser will set it with boundary
-      });
+      // Use fetch API to upload to News API server (with /api/media/upload path)
+      console.log('🔄 Uploading to News API server:', `${NEWS_API_BASE_URL}/api/media/upload`);
+      
+      let uploadResponse;
+      try {
+        uploadResponse = await fetch(`${NEWS_API_BASE_URL}/api/media/upload`, {
+          method: 'POST',
+          body: formData,
+          // Don't set Content-Type - browser will set it with boundary
+        });
+      } catch (networkError: any) {
+        console.error('❌ Network error uploading media:', networkError);
+        throw new Error(`Cannot connect to News API server at ${NEWS_API_BASE_URL}. Please ensure the News API server is running on port 5173.`);
+      }
       
       if (!uploadResponse.ok) {
         const errorText = await uploadResponse.text();
@@ -348,20 +410,29 @@ export const uploadMedia = async (fileUri: string, mediaType: 'image'|'video') =
       const data = await uploadResponse.json();
       console.log('📡 Server response:', data);
       
-      // Extract mediaUrl and filePath from response
-      const mediaUrl = data?.data?.file_path || data?.mediaUrl || data?.file_path || data?.url || data?.filePath;
-      const filePath = data?.data?.file_path || data?.file_path;
-      
-      if (!mediaUrl) {
-        console.error('❌ Invalid upload response (missing mediaUrl):', data);
-        throw new Error('Server did not return a valid media URL. Got: ' + JSON.stringify(data));
+      // Extract media info from News API response
+      // Response format: { message: "...", media: [{ media_id, media_type, file_path, thumbnail_path, original_name, size }] }
+      const mediaItem = data?.media?.[0];
+      if (!mediaItem || !mediaItem.file_path) {
+        console.error('❌ Invalid upload response (missing media data):', data);
+        throw new Error('Server did not return valid media data. Got: ' + JSON.stringify(data));
       }
       
+      // Construct full media URL using NEWS_API_BASE_URL base + file_path
+      const mediaUrl = `${NEWS_API_BASE_URL}${mediaItem.file_path}`;
+      
       console.log('✅ Media uploaded:', mediaUrl);
-      return { mediaUrl, filePath };
+      console.log('📋 Media details:', mediaItem);
+      return { 
+        mediaUrl, 
+        filePath: mediaItem.file_path,
+        mediaId: mediaItem.media_id,
+        thumbnailPath: mediaItem.thumbnail_path,
+        mediaType: mediaItem.media_type
+      };
       
     } else {
-      // For native platforms - use axios
+      // For native platforms - use mediaApi for media upload
       const fileType = mediaType === 'image' ? 'image/jpeg' : 'video/mp4';
       const filename = fileUri.split('/').pop() || 'media';
       
@@ -371,31 +442,35 @@ export const uploadMedia = async (fileUri: string, mediaType: 'image'|'video') =
         type: fileType,
       } as any);
       
-      // Use Python AI server for media upload
-      console.log('🔄 Uploading to AI server:', `${AI_BASE_URL}/upload`);
-      const uploadResponse = await aiApi.post('/upload', formData, {
+      // Use mediaApi with /api/media/upload path
+      console.log('🔄 Uploading to News API server:', `${NEWS_API_BASE_URL}/api/media/upload`);
+      const uploadResponse = await mediaApi.post('/api/media/upload', formData, {
         headers: {
-          // Don't set Content-Type manually - let axios set it with the boundary
+          'Content-Type': 'multipart/form-data',
         },
       });
       
       console.log('📡 Server response:', uploadResponse.data);
       
-      // Extract mediaUrl and filePath from response (handle multiple response formats)
-      const mediaUrl = uploadResponse.data?.data?.file_path || 
-                     uploadResponse.data?.mediaUrl || 
-                     uploadResponse.data?.file_path || 
-                     uploadResponse.data?.url ||
-                     uploadResponse.data?.filePath;
-      const filePath = uploadResponse.data?.data?.file_path || uploadResponse.data?.file_path;
-      
-      if (!mediaUrl) {
-        console.error('❌ Invalid upload response (missing mediaUrl):', uploadResponse.data);
-        throw new Error('Server did not return a valid media URL. Got: ' + JSON.stringify(uploadResponse.data));
+      // Extract media info from News API response
+      const mediaItem = uploadResponse.data?.media?.[0];
+      if (!mediaItem || !mediaItem.file_path) {
+        console.error('❌ Invalid upload response (missing media data):', uploadResponse.data);
+        throw new Error('Server did not return valid media data. Got: ' + JSON.stringify(uploadResponse.data));
       }
       
+      // Construct full media URL
+      const mediaUrl = `${NEWS_API_BASE_URL}${mediaItem.file_path}`;
+      
       console.log('✅ Media uploaded:', mediaUrl);
-      return { mediaUrl, filePath };
+      console.log('📋 Media details:', mediaItem);
+      return { 
+        mediaUrl, 
+        filePath: mediaItem.file_path,
+        mediaId: mediaItem.media_id,
+        thumbnailPath: mediaItem.thumbnail_path,
+        mediaType: mediaItem.media_type
+      };
     }
   } catch (error: any) {
     const status = error.response?.status;
@@ -484,36 +559,56 @@ export const uploadAndTranscribeAudio = async (fileUri: string) => {
 
 // --- Audio Upload ---
 // Step 1: Upload audio file to /upload endpoint
-export const uploadAudio = async (fileUri: string) => {
-  const filename = fileUri.split('/').pop();
-  const fileType = 'audio/mpeg';
+export const uploadAudio = async (fileUri: string, originalFilename?: string) => {
+  const filename = originalFilename || fileUri.split('/').pop() || 'audio.mp3';
   const formData = new FormData();
   
   if (Platform.OS === 'web') {
     const response = await fetch(fileUri);
     const blob = await response.blob();
-    const file = new File([blob], filename || 'audio.mp3', { type: blob.type });
+    
+    // Determine correct mime type based on file extension
+    let mimeType = blob.type;
+    const ext = filename.toLowerCase().split('.').pop();
+    if (ext === 'm4a') mimeType = 'audio/mp4';
+    else if (ext === 'mp3') mimeType = 'audio/mpeg';
+    else if (ext === 'wav') mimeType = 'audio/wav';
+    else if (ext === 'ogg') mimeType = 'audio/ogg';
+    else if (!mimeType.startsWith('audio/')) mimeType = 'audio/mpeg'; // Default to audio
+    
+    console.log('📁 Uploading audio file:', filename, 'Type:', mimeType, 'Size:', blob.size);
+    
+    const file = new File([blob], filename, { type: mimeType });
     formData.append('file', file);
   } else {
     formData.append('file', {
       uri: fileUri,
       name: filename,
-      type: fileType,
+      type: 'audio/mpeg',
     } as any);
   }
 
   try {
     console.log('🔄 Step 1: Uploading audio to:', `${AI_BASE_URL}/upload`);
+    console.log('📦 FormData contains file:', filename);
+    
     const response = await aiApi.post('/upload', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' }
+      headers: { 'Content-Type': 'multipart/form-data' },
+      // Prevent caching
+      params: { _t: Date.now() }
     });
     console.log('✅ Upload response:', response.data);
+    console.log('📂 Response data structure:', JSON.stringify(response.data, null, 2));
     
-    // Extract filePath from response
-    const filePath = response.data?.filePath || response.data?.file_path || response.data?.data?.file_path;
+    // Extract filePath from response - server returns data.file_path
+    const filePath = response.data?.data?.file_path || response.data?.file_path || response.data?.filePath;
     if (!filePath) {
-      throw new Error('Server did not return filePath');
+      console.error('❌ Server response:', JSON.stringify(response.data, null, 2));
+      throw new Error('Server did not return file_path. Check server response above.');
     }
+    
+    console.log('✅ Extracted file path:', filePath);
+    console.log('🔍 File extension check:', filePath.split('.').pop());
     
     return { filePath };
   } catch (err: any) {
@@ -527,10 +622,15 @@ export const uploadAudio = async (fileUri: string) => {
 export const transcribeAudioFile = async (filePath: string) => {
   try {
     console.log('🔄 Step 2: Transcribing audio with filePath:', filePath);
-    const response = await aiApi.post('/transcribe', { filePath });
+    const formData = new FormData();
+    formData.append('file_path', filePath);
+    
+    const response = await aiApi.post('/transcribe-and-generate', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    });
     console.log('✅ Transcription response:', response.data);
     
-    const transcript = response.data?.transcript || response.data?.text;
+    const transcript = response.data?.data?.transcript || response.data?.transcript;
     if (!transcript) {
       throw new Error('Server did not return transcript');
     }
@@ -547,11 +647,16 @@ export const transcribeAudioFile = async (filePath: string) => {
 export const generateNewsFromTranscript = async (transcript: string) => {
   try {
     console.log('🔄 Step 3: Generating news from transcript');
-    const response = await aiApi.post('/transcribe-and-generate', { transcript });
+    const formData = new FormData();
+    formData.append('transcript', transcript);
+    
+    const response = await aiApi.post('/polish-from-transcript', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    });
     console.log('✅ Generation response:', response.data);
     
-    const title = response.data?.title || '';
-    const content = response.data?.content || '';
+    const title = response.data?.data?.title || response.data?.title || '';
+    const content = response.data?.data?.content || response.data?.content || '';
     
     return { title, content };
   } catch (err: any) {
@@ -630,6 +735,189 @@ export const testTranscribeWithFilePath = async (filePath: string) => {
   } catch (err: any) {
     console.error('❌ Transcribe test failed:', err?.response?.data || err.message || err);
     throw err;
+  }
+};
+
+// --- NEWS MANAGEMENT API FUNCTIONS ---
+
+// TypeScript interfaces for News Management
+export interface NewsData {
+  journalist_id: string;
+  news_title: string;
+  news_description: string;
+  category_id: number;
+  sub_category_name?: string;
+  latitude?: number;
+  longitude?: number;
+  location?: string;
+  media_url?: string;
+  media_type?: string;
+}
+
+export interface CreateNewsResponse {
+  news_id: string;
+  message: string;
+  status: string;
+  sub_category_id: number;
+  assignment: {
+    message: string;
+    approver1: {
+      id: string;
+      name: string;
+      pending_count: number;
+    };
+    approver2: {
+      id: string;
+      name: string;
+      pending_count: number;
+    };
+    notificationSent: boolean;
+  };
+}
+
+export interface NewsItem {
+  news_id: string;
+  news_title: string;
+  news_description: string;
+  category_id: number;
+  category_name: string;
+  status_code: 'DRAFT' | 'PENDING' | 'APPROVED' | 'PUBLISHED' | 'REJECTED';
+  creation_date: string;
+  published_date: string | null;
+  journalist_id: string;
+  reporter_name: string;
+  approver1_id: string;
+  approver2_id: string;
+  approver1_name: string;
+  approver2_name: string;
+  approver1_status: string;
+  approver2_status: string;
+  sub_category_name?: string;
+  location?: string;
+  media_url?: string;
+  media_type?: string;
+}
+
+// Create news (creates as PENDING and auto-assigns approvers)
+export const createNews = async (data: NewsData): Promise<CreateNewsResponse> => {
+  try {
+    console.log('🔄 Creating news (will be PENDING with auto-assignment):', data);
+    const response = await newsApi.post('/news', data);
+    console.log('✅ News created:', response.data);
+    console.log('✅ Assignment info:', response.data.assignment);
+    return response.data;
+  } catch (err: any) {
+    console.error('❌ Create news failed:', err?.response?.data || err.message || err);
+    throw err;
+  }
+};
+
+// Update news
+export const updateNews = async (data: Partial<NewsData> & { news_id: string; status_code?: string }): Promise<{ success: boolean; message: string }> => {
+  try {
+    console.log('🔄 Updating news:', data);
+    const response = await newsApi.post('/news/update', data);
+    console.log('✅ News updated:', response.data);
+    return response.data;
+  } catch (err: any) {
+    console.error('❌ Update news failed:', err?.response?.data || err.message || err);
+    throw err;
+  }
+};
+
+// Submit news for approval (for DRAFT news, moves to PENDING)
+export const submitNewsForApproval = async (newsId: string): Promise<{ success: boolean; message: string }> => {
+  try {
+    console.log('🔄 Submitting news for approval:', newsId);
+    const response = await newsApi.post('/news/submit', { news_id: newsId });
+    console.log('✅ News submitted:', response.data);
+    return response.data;
+  } catch (err: any) {
+    console.error('❌ Submit news failed:', err?.response?.data || err.message || err);
+    throw err;
+  }
+};
+
+// Fetch all news by journalist ID
+export const fetchNewsByJournalist = async (journalistId: string): Promise<NewsItem[]> => {
+  try {
+    console.log('🔄 Fetching news for journalist:', journalistId);
+    const response = await newsApi.get(`/news/by-journalist/${journalistId}`);
+    console.log('✅ News fetched:', response.data);
+    
+    const newsList = Array.isArray(response.data) ? response.data : [];
+    
+    // Fetch media data to associate with news items
+    let mediaMap = {};
+    try {
+      const mediaResponse = await newsApi.get('/media/');
+      console.log('📡 Fetched media data:', mediaResponse.data.length, 'items');
+      
+      // Create a map of news_id to media info
+      if (Array.isArray(mediaResponse.data)) {
+        mediaResponse.data.forEach((media: any) => {
+          if (media.news_id) {
+            mediaMap[media.news_id] = {
+              url: `${NEWS_API_BASE_URL}${media.file_path}`,
+              type: media.media_type,
+              thumbnail: media.thumbnail_path ? `${NEWS_API_BASE_URL}${media.thumbnail_path}` : null,
+            };
+          }
+        });
+      }
+      console.log('📡 Created media map with', Object.keys(mediaMap).length, 'entries');
+    } catch (mediaError) {
+      console.warn('⚠️ Could not fetch media data:', mediaError);
+    }
+    
+    // Merge media data with news items
+    return newsList.map((item: any) => {
+      const mediaInfo = mediaMap[item.news_id];
+      return {
+        ...item,
+        media_url: mediaInfo?.url || item.media_url || null,
+        media_type: mediaInfo?.type || item.media_type || null,
+      };
+    });
+  } catch (err: any) {
+    console.error('❌ Fetch news failed:', err?.response?.data || err.message || err);
+    throw err;
+  }
+};
+
+// Helper function to get status color
+export const getStatusColor = (status: string): string => {
+  switch (status) {
+    case 'DRAFT':
+      return '#9E9E9E'; // Gray
+    case 'PENDING':
+      return '#FFC107'; // Yellow/Amber
+    case 'APPROVED':
+      return '#2196F3'; // Blue
+    case 'PUBLISHED':
+      return '#4CAF50'; // Green
+    case 'REJECTED':
+      return '#F44336'; // Red
+    default:
+      return '#9E9E9E';
+  }
+};
+
+// Helper function to get status text
+export const getStatusText = (status: string): string => {
+  switch (status) {
+    case 'DRAFT':
+      return 'Draft';
+    case 'PENDING':
+      return 'Pending Review';
+    case 'APPROVED':
+      return 'Approved';
+    case 'PUBLISHED':
+      return 'Published';
+    case 'REJECTED':
+      return 'Rejected';
+    default:
+      return status;
   }
 };
 

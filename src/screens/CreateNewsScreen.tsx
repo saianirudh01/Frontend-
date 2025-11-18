@@ -27,6 +27,11 @@ import {
   submitNews,
   polishText, // The new API function
   testTranscribeWithFilePath, // Test function for transcription
+  createNews,
+  submitNewsForApproval,
+  updateNews,
+  NewsData,
+  CreateNewsResponse,
 } from '../services/api';
 import axios from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -141,13 +146,16 @@ export default function CreateNewsScreen() {
   const [date, setDate] = useState(new Date());
   
   // Location State
-  const [location, setLocation] = useState(draft?.location || 'Loading location...');
+  const [location, setLocation] = useState(draft?.location || '');
+  const [locationLoading, setLocationLoading] = useState(true);
 
   // Media State
   const [localMediaUri, setLocalMediaUri] = useState(draft?.localMediaUri || null);
   const [mediaUrl, setMediaUrl] = useState(draft?.mediaUrl || null);
   const [mediaType, setMediaType] = useState(draft?.mediaType || null);
   const [existingDraftId, setExistingDraftId] = useState(draft?.id || null);
+  const [createdNewsId, setCreatedNewsId] = useState<string | null>(null);
+  const [newsSubmissionStep, setNewsSubmissionStep] = useState<'idle' | 'saved' | 'submitted'>('idle');
 
   // Audio State
   const [sound, setSound] = useState<Audio.Sound | null>(null);
@@ -157,6 +165,10 @@ export default function CreateNewsScreen() {
 
   // Audio file path state
   const [audioFilePath, setAudioFilePath] = useState<string | null>(null);
+  
+  // Three-step audio workflow state
+  const [audioWorkflowStep, setAudioWorkflowStep] = useState<'idle' | 'uploaded' | 'transcribed' | 'generated'>('idle');
+  const [rawTranscript, setRawTranscript] = useState<string>('');
 
   // Modal States
   const [isCategoryModalVisible, setIsCategoryModalVisible] = useState(false);
@@ -173,19 +185,29 @@ export default function CreateNewsScreen() {
       await ImagePicker.requestCameraPermissionsAsync();
       await ImagePicker.requestMediaLibraryPermissionsAsync();
       
+      setLocationLoading(true);
       let { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== 'granted') {
         Alert.alert('Permission denied', 'Cannot get location.');
-        setLocation('Permission denied');
+        setLocation('Location unavailable');
+        setLocationLoading(false);
         return;
       }
 
-      let locationData = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
-      let geocode = await Location.reverseGeocodeAsync(locationData.coords);
-      if (geocode.length > 0) {
-        const { city, country } = geocode[0];
-        setLocation(`${city || 'Unknown'}, ${country || 'Unknown'}`);
+      try {
+        let locationData = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+        let geocode = await Location.reverseGeocodeAsync(locationData.coords);
+        if (geocode.length > 0) {
+          const { city, country } = geocode[0];
+          setLocation(`${city || 'Unknown'}, ${country || 'Unknown'}`);
+        } else {
+          setLocation('Location unavailable');
+        }
+      } catch (error) {
+        console.error('Location error:', error);
+        setLocation('Location unavailable');
       }
+      setLocationLoading(false);
     })();
   }, []);
 
@@ -204,7 +226,7 @@ export default function CreateNewsScreen() {
     try {
       console.log('Launching ImagePicker...');
       result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.All,
+        mediaTypes: ['images', 'videos'],
         quality: 0.8,
       });
 
@@ -245,8 +267,24 @@ export default function CreateNewsScreen() {
       }
       
       const asset = result.assets[0];
+      
+      // Validate file extension - must be audio
+      const fileName = asset.name || asset.uri.split('/').pop() || '';
+      const fileExt = fileName.toLowerCase().split('.').pop();
+      const validAudioExtensions = ['mp3', 'wav', 'm4a', 'ogg', 'aac', 'flac', 'wma', 'webm'];
+      
+      if (!validAudioExtensions.includes(fileExt || '')) {
+        Alert.alert('Invalid File', `Please select an audio file. Selected file: ${fileName}\n\nSupported formats: MP3, WAV, M4A, OGG, AAC`);
+        return;
+      }
+      
       setAudioUri(asset.uri);
       setAudioFileName(asset.name);
+      
+      // Reset workflow state when new audio is selected
+      setAudioFilePath(null);
+      setAudioWorkflowStep('idle');
+      setRawTranscript('');
       
       if (soundRef.current) {
         await soundRef.current.unloadAsync();
@@ -254,8 +292,8 @@ export default function CreateNewsScreen() {
       const { sound: newSound } = await Audio.Sound.createAsync({ uri: asset.uri });
       soundRef.current = newSound;
 
-      // Process audio: upload, transcribe, and generate title/content
-      await handleAudioProcessing(asset.uri);
+      // Step 1: Upload audio and get file path
+      await handleAudioUpload(asset.uri, asset.name);
 
     } catch (err) {
       console.warn(err);
@@ -263,38 +301,78 @@ export default function CreateNewsScreen() {
     }
   };
   
-  // Audio processing: nested flow (upload → transcribe → generate)
-  const handleAudioProcessing = async (uri: string) => {
+  // Step 1: Upload audio file
+  const handleAudioUpload = async (uri: string, filename?: string) => {
     try {
       setLoadingText('Uploading Audio');
       
-      // This function now handles all three steps internally
-      const { title: generatedTitle, content: generatedContent, filePath } = await uploadAndTranscribeAudio(uri);
+      const { filePath } = await uploadAudio(uri, filename);
       
-      // Store the file path for display
-      if (filePath) {
-        setAudioFilePath(filePath);
-      }
+      setAudioFilePath(filePath);
+      setAudioWorkflowStep('uploaded');
       
-      console.log('🔍 BEFORE setState - generatedTitle:', generatedTitle);
-      console.log('🔍 BEFORE setState - generatedContent:', generatedContent);
-      
-      // Update the form fields
-      setTitle(generatedTitle);
-      setDescription(generatedContent);
-      
-      console.log('✅ Audio processing complete - Title and content generated');
-      
-      // Debug: Check state after a brief delay
-      setTimeout(() => {
-        console.log('🔍 AFTER setState (delayed check) - title state should be:', generatedTitle);
-        console.log('🔍 AFTER setState (delayed check) - description state should be:', generatedContent);
-      }, 100);
+      console.log('✅ Step 1 complete - File uploaded:', filePath);
       
     } catch (error) {
-      console.error('Audio processing error:', error);
-      const errorMessage = error.response?.data?.message || error.message || 'Failed to process audio.';
-      Alert.alert('Processing Error', errorMessage);
+      console.error('Audio upload error:', error);
+      const errorMessage = error.response?.data?.message || error.message || 'Failed to upload audio.';
+      Alert.alert('Upload Error', errorMessage);
+    } finally {
+      setLoadingText(null);
+    }
+  };
+  
+  // Step 2: Generate transcript from uploaded audio
+  const handleGenerateTranscript = async () => {
+    if (!audioFilePath) {
+      Alert.alert('Error', 'No audio file uploaded');
+      return;
+    }
+    
+    try {
+      setLoadingText('Generating Transcript');
+      
+      const { transcript } = await transcribeAudioFile(audioFilePath);
+      
+      setRawTranscript(transcript);
+      setDescription(transcript); // Put transcript in description box for editing
+      setAudioWorkflowStep('transcribed');
+      
+      console.log('✅ Step 2 complete - Transcript generated');
+      
+    } catch (error) {
+      console.error('Transcription error:', error);
+      const errorMessage = error.response?.data?.message || error.message || 'Failed to generate transcript.';
+      Alert.alert('Transcription Error', errorMessage);
+    } finally {
+      setLoadingText(null);
+    }
+  };
+  
+  // Step 3: Create article from transcript
+  const handleCreateArticleFromTranscript = async () => {
+    const transcriptToUse = description.trim() || rawTranscript;
+    
+    if (!transcriptToUse) {
+      Alert.alert('Error', 'No transcript available');
+      return;
+    }
+    
+    try {
+      setLoadingText('Creating Article');
+      
+      const { title: generatedTitle, content: generatedContent } = await generateNewsFromTranscript(transcriptToUse);
+      
+      setTitle(generatedTitle);
+      setDescription(generatedContent);
+      setAudioWorkflowStep('generated');
+      
+      console.log('✅ Step 3 complete - Article created');
+      
+    } catch (error) {
+      console.error('Article generation error:', error);
+      const errorMessage = error.response?.data?.message || error.message || 'Failed to create article.';
+      Alert.alert('Generation Error', errorMessage);
     } finally {
       setLoadingText(null);
     }
@@ -376,126 +454,197 @@ export default function CreateNewsScreen() {
     setIsCategoryModalVisible(false);
   };
   
-  // Main Submit Function
-  const handleSubmit = async (type: 'draft' | 'submit') => {
-    // Check if media exists (either as local URI or already uploaded URL)
-    if (type === 'submit' && !mediaUrl && !localMediaUri) {
-      Alert.alert('Media Missing', 'Please upload an image or video before submitting.');
-      return;
-    }
-    
-    if (!title) {
-      Alert.alert('Title Missing', 'Please add a title.');
-      return;
-    }
-    
-    // --- NEW: Check for user and jornalistId ---
-    if (type === 'submit' && (!user || !user.jornalistId)) {
-        Alert.alert('Error', 'Could not find reporter ID. Please log out and log back in.');
-        return;
-    }
-
-    setLoadingText(type === 'draft' ? 'Saving Draft' : 'Submitting News');
-    
-    // Upload media if it exists locally but hasn't been uploaded yet
-    let finalMediaUrl = mediaUrl;
-    if (localMediaUri && !mediaUrl) {
-      try {
-        setLoadingText('Uploading Media...');
-        const response = await uploadMedia(localMediaUri, mediaType || 'image');
-        if (response?.mediaUrl) {
-          finalMediaUrl = response.mediaUrl;
-          setMediaUrl(response.mediaUrl);
-          console.log('✅ Media uploaded during submit:', response.mediaUrl);
-        }
-      } catch (error: any) {
-        setLoadingText(null);
-        console.error('❌ Failed to upload media:', error);
-        Alert.alert('Upload Error', 'Failed to upload media. Please try again.');
-        return;
-      }
-    }
-    
-    setLoadingText(type === 'draft' ? 'Saving Draft' : 'Submitting News');
-    
-    const liveDate = date.toISOString().split('T')[0];
-    const liveTime = date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
-
-    const newsData = {
-      id: existingDraftId || `draft_${Date.now()}`,
-      title,
-      description,
-      category,
-      date: liveDate,
-      time: liveTime,
-      location: location,
-      mediaUrl: finalMediaUrl,
-      localMediaUri,
-      mediaType,
-      status: type,
-      // Attach the reporter ID and timestamp so dashboard can associate drafts
-      jornalistId: user?.jornalistId || null,
-      savedAt: new Date().toISOString(),
+  // Helper to map category names to IDs
+  const getCategoryId = (categoryName: string): number => {
+    const categoryMap: Record<string, number> = {
+      'Politics': 1,
+      'Business': 2,
+      'Technology': 3,
+      'Sports': 4,
+      'Entertainment': 5,
+      'Health': 6,
+      'Science': 7,
+      'World': 8,
+      'General News': 9,
     };
+    return categoryMap[categoryName] || 9;
+  };
 
-    if (type === 'draft') {
-      try {
-        const existingDrafts = await AsyncStorage.getItem('drafts');
-        const drafts = existingDrafts ? JSON.parse(existingDrafts) : [];
-        const otherDrafts = drafts.filter(d => d.id !== newsData.id);
-        const updatedDrafts = [...otherDrafts, newsData];
-        await AsyncStorage.setItem('drafts', JSON.stringify(updatedDrafts));
+  // Main Submit Function - Integrated with News Management API
+  const handleSubmit = async (type: 'draft' | 'submit') => {
+    // Validation
+    if (!title.trim()) {
+      Alert.alert('Title Missing', 'Please add a news title.');
+      return;
+    }
+    
+    if (!description.trim()) {
+      Alert.alert('Description Missing', 'Please add a news description.');
+      return;
+    }
+    
+    if (!user || !user.jornalistId) {
+      Alert.alert('Error', 'Could not find reporter ID. Please log out and log back in.');
+      return;
+    }
 
-        setLoadingText(null);
-        setSuccessModalInfo({
-          visible: true,
-          title: 'News Post saved!',
-          message: `News ID: #${newsData.id.split('_').pop()}`
-        });
-
-      } catch (e) {
-        setLoadingText(null);
-        Alert.alert('Error', 'Failed to save draft.');
-      }
-    } else {
-      // --- NEW: Submission data now includes jornalistId ---
-      try {
-        const submissionData = {
-          jornalistId: user.jornalistId, // <-- The new required ID
-          title,
-          description,
-          category,
-          date: liveDate,
-          time: liveTime,
-          location: location,
-          mediaUrl: finalMediaUrl,
-          mediaType,
-        };
-
-        const response = await submitNews(submissionData);
-        
-        if (existingDraftId) {
-          const existingDrafts = await AsyncStorage.getItem('drafts');
-          const drafts = existingDrafts ? JSON.parse(existingDrafts) : [];
-          const otherDrafts = drafts.filter(d => d.id !== existingDraftId);
-          await AsyncStorage.setItem('drafts', JSON.stringify(otherDrafts));
+    try {
+      // Step 1: Upload media if needed
+      let finalMediaUrl = mediaUrl;
+      if (localMediaUri && !mediaUrl) {
+        setLoadingText('Uploading Media...');
+        try {
+          const response = await uploadMedia(localMediaUri, mediaType || 'image');
+          if (response?.mediaUrl) {
+            finalMediaUrl = response.mediaUrl;
+            setMediaUrl(response.mediaUrl);
+            console.log('✅ Media uploaded:', response.mediaUrl);
+          }
+        } catch (mediaError: any) {
+          console.error('❌ Media upload failed:', mediaError);
+          // Show error but allow continuing without media
+          Alert.alert(
+            'Media Upload Failed',
+            `${mediaError.message}\n\nDo you want to continue submitting without media?`,
+            [
+              { text: 'Cancel', style: 'cancel', onPress: () => { setLoadingText(null); return; } },
+              { text: 'Continue', onPress: () => {} }
+            ]
+          );
+          // Wait for user decision before continuing
+          await new Promise(resolve => setTimeout(resolve, 100));
         }
-        
-        setLoadingText(null);
-        setSuccessModalInfo({
-          visible: true,
-          title: 'News Post Submitted!',
-          message: `News ID: #${response.newsId.slice(0, 8)}`
-        });
-
-      } catch (error) {
-        console.error('❌ Submission error:', error);
-        console.error('❌ Error response:', error.response?.data);
-        console.error('❌ Error status:', error.response?.status);
-        const errorMessage = error.response?.data?.error || error.response?.data?.message || error.message || 'Failed to submit your news.';
-        setLoadingText(null);
-        Alert.alert('Submission Error', errorMessage);
       }
+      
+      // Step 2: Handle based on action type
+      if (type === 'draft') {
+        // Save as draft - use update if exists, create if new
+        setLoadingText('Saving Draft...');
+        
+        if (createdNewsId) {
+          // Update existing draft
+          const updateData = {
+            news_id: createdNewsId,
+            news_title: title,
+            news_description: description,
+            category_id: getCategoryId(category),
+            sub_category_name: category,
+            location: location,
+            media_url: finalMediaUrl || undefined,
+            media_type: mediaType || undefined,
+            status_code: 'DRAFT',
+          };
+          
+          const updateResponse = await updateNews(updateData);
+          
+          if (updateResponse.success) {
+            setLoadingText(null);
+            Alert.alert(
+              'Success',
+              'Draft updated successfully!',
+              [{ text: 'OK' }]
+            );
+          }
+        } else {
+          // Create new news - Note: API creates as PENDING with auto-assignment
+          const newsData: NewsData = {
+            journalist_id: user.jornalistId,
+            news_title: title,
+            news_description: description,
+            category_id: getCategoryId(category),
+            sub_category_name: category,
+            location: location,
+            media_url: finalMediaUrl || undefined,
+            media_type: mediaType || undefined,
+          };
+          
+          const createResponse: CreateNewsResponse = await createNews(newsData);
+          
+          if (createResponse.news_id) {
+            setCreatedNewsId(createResponse.news_id);
+            setNewsSubmissionStep('submitted'); // API creates as PENDING
+            
+            console.log('✅ News created with ID:', createResponse.news_id);
+            console.log('✅ Status:', createResponse.status);
+            console.log('✅ Approvers assigned:', createResponse.assignment);
+            
+            setLoadingText(null);
+            Alert.alert(
+              'Success',
+              `News created and submitted for approval!\\n\\nNews ID: ${createResponse.news_id}\\nStatus: ${createResponse.status}\\n\\nApprover 1: ${createResponse.assignment.approver1.name}\\nApprover 2: ${createResponse.assignment.approver2.name}`,
+              [{ text: 'OK' }]
+            );
+          }
+        }
+      } else if (type === 'submit') {
+        // Submit for approval
+        if (!createdNewsId) {
+          // Create new news (API auto-creates as PENDING with assignment)
+          setLoadingText('Creating and Submitting...');
+          
+          const newsData: NewsData = {
+            journalist_id: user.jornalistId,
+            news_title: title,
+            news_description: description,
+            category_id: getCategoryId(category),
+            sub_category_name: category,
+            location: location,
+            media_url: finalMediaUrl || undefined,
+            media_type: mediaType || undefined,
+          };
+          
+          const createResponse: CreateNewsResponse = await createNews(newsData);
+          
+          if (createResponse.news_id) {
+            setLoadingText(null);
+            setSuccessModalInfo({
+              visible: true,
+              title: 'News Submitted!',
+              message: `News ID: #${createResponse.news_id.slice(0, 8)}\\nAssigned to: ${createResponse.assignment.approver1.name} & ${createResponse.assignment.approver2.name}`
+            });
+            
+            // Reset form
+            setTitle('');
+            setDescription('');
+            setCategory('Politics');
+            setLocalMediaUri(null);
+            setMediaUrl(null);
+            setCreatedNewsId(null);
+            setNewsSubmissionStep('idle');
+          }
+        } else {
+          // Submit existing draft
+          setLoadingText('Submitting for Approval...');
+          
+          const submitResponse = await submitNewsForApproval(createdNewsId);
+          
+          if (submitResponse.success) {
+            setNewsSubmissionStep('submitted');
+            setLoadingText(null);
+            
+            setSuccessModalInfo({
+              visible: true,
+              title: 'News Submitted!',
+              message: `News ID: #${createdNewsId.slice(0, 8)}`
+            });
+            
+            // Reset form
+            setTitle('');
+            setDescription('');
+            setCategory('Politics');
+            setLocalMediaUri(null);
+            setMediaUrl(null);
+            setCreatedNewsId(null);
+            setNewsSubmissionStep('idle');
+          }
+        }
+      }
+      
+    } catch (error: any) {
+      console.error('❌ Submission error:', error);
+      setLoadingText(null);
+      const errorMessage = error.response?.data?.message || error.message || 'Failed to process your news.';
+      Alert.alert('Error', errorMessage);
     }
   };
 
@@ -623,10 +772,45 @@ export default function CreateNewsScreen() {
             </View>
             
             {/* Display audio file path */}
-            {audioFilePath && (
+            {audioFilePath && audioWorkflowStep !== 'idle' && (
               <View style={styles.filePathContainer}>
-                <Text style={styles.filePathLabel}>Uploaded Audio File Path:</Text>
-                <Text style={styles.filePathText} numberOfLines={2}>{audioFilePath}</Text>
+                <Text style={styles.filePathLabel}>File Path:</Text>
+                <TextInput
+                  style={styles.filePathInput}
+                  value={audioFilePath}
+                  editable={false}
+                  numberOfLines={1}
+                />
+              </View>
+            )}
+            
+            {/* Step 2: Generate Transcript Button */}
+            {audioWorkflowStep === 'uploaded' && (
+              <TouchableOpacity
+                style={styles.workflowButton}
+                onPress={handleGenerateTranscript}
+                disabled={isLoading}>
+                <Ionicons name="document-text-outline" size={20} color="#FFFFFF" />
+                <Text style={styles.workflowButtonText}>Generate Transcript</Text>
+              </TouchableOpacity>
+            )}
+            
+            {/* Step 3: Create Article Button */}
+            {audioWorkflowStep === 'transcribed' && (
+              <TouchableOpacity
+                style={styles.workflowButton}
+                onPress={handleCreateArticleFromTranscript}
+                disabled={isLoading}>
+                <Ionicons name="newspaper-outline" size={20} color="#FFFFFF" />
+                <Text style={styles.workflowButtonText}>Create Article from Transcript</Text>
+              </TouchableOpacity>
+            )}
+            
+            {/* Completion indicator */}
+            {audioWorkflowStep === 'generated' && (
+              <View style={styles.completionIndicator}>
+                <Ionicons name="checkmark-circle" size={20} color="#4CAF50" />
+                <Text style={styles.completionText}>Article generated successfully!</Text>
               </View>
             )}
           </>
@@ -661,7 +845,6 @@ export default function CreateNewsScreen() {
             State value: {title || '(empty)'}
           </Text>
           <View style={styles.aiInputContainer}>
-            <Ionicons name="sparkles-outline" size={22} color="#007AFF" style={styles.aiIcon} />
             <TextInput
               style={styles.aiInput}
               placeholder="Enter Title"
@@ -683,7 +866,6 @@ export default function CreateNewsScreen() {
             State value: {description.substring(0, 50) || '(empty)'}...
           </Text>
           <View style={[styles.aiInputContainer, styles.aiTextAreaContainer]}>
-            <Ionicons name="sparkles-outline" size={22} color="#007AFF" style={styles.aiIcon} />
             <TextInput
               style={[styles.aiInput, styles.aiTextArea]}
               placeholder="Enter Description"
@@ -1053,24 +1235,68 @@ const styles = StyleSheet.create({
   },
   // --- FILE PATH DISPLAY ---
   filePathContainer: {
-    backgroundColor: '#E3F2FD',
+    backgroundColor: '#F5F5F5',
     borderRadius: 8,
-    padding: 15,
+    padding: 12,
     marginHorizontal: 20,
     marginTop: 10,
     marginBottom: 10,
   },
   filePathLabel: {
     fontSize: 12,
-    fontWeight: 'bold',
-    color: '#1565C0',
+    fontWeight: '600',
+    color: '#757575',
     marginBottom: 5,
+  },
+  filePathInput: {
+    fontSize: 11,
+    color: '#424242',
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#E0E0E0',
+    borderRadius: 6,
+    padding: 8,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
   },
   filePathText: {
     fontSize: 11,
     color: '#424242',
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
     marginBottom: 10,
+  },
+  workflowButton: {
+    backgroundColor: '#007AFF',
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    borderRadius: 8,
+    marginHorizontal: 20,
+    marginTop: 12,
+    marginBottom: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  workflowButtonText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  completionIndicator: {
+    backgroundColor: '#E8F5E9',
+    borderRadius: 8,
+    padding: 14,
+    marginHorizontal: 20,
+    marginTop: 12,
+    marginBottom: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  completionText: {
+    color: '#2E7D32',
+    fontSize: 14,
+    fontWeight: '600',
   },
   testButtonsRow: {
     flexDirection: 'row',
